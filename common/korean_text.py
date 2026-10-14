@@ -1,7 +1,7 @@
 """OpenCV 화면에 한글 출력
 
 cv2.putText는 한글을 그리지 못하므로 Pillow로 그린 뒤 프레임에 다시 넣는다.
-한글 폰트가 없으면: sudo apt install fonts-nanum
+한글 폰트가 없으면: Ubuntu는 sudo apt install fonts-nanum, Windows는 기본 맑은 고딕 사용
 """
 import subprocess
 from pathlib import Path
@@ -16,6 +16,8 @@ FONT_CANDIDATES = [
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/unfonts-core/UnDotum.ttf",
+    "C:/Windows/Fonts/malgun.ttf",       # Windows 맑은 고딕
+    "C:/Windows/Fonts/gulim.ttc",
 ]
 
 
@@ -32,7 +34,8 @@ def find_korean_font():
                 return path
     except (OSError, subprocess.SubprocessError):
         pass
-    raise FileNotFoundError("한글 폰트가 없습니다. 설치: sudo apt install fonts-nanum")
+    raise FileNotFoundError("한글 폰트가 없습니다. Ubuntu: sudo apt install fonts-nanum, "
+                            "Windows: C:/Windows/Fonts/malgun.ttf 확인")
 
 
 class TextRenderer:

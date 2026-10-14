@@ -7,6 +7,7 @@
   python -m learning.image_train --kind cnn --labels fine   # 거북목·구부정을 나눈 5개 라벨로 학습
   python -m learning.image_train --kind cnn --image-dir images_crop   # 사람 영역 crop 이미지로 학습
                                                           # (먼저 python -m learning.crop_images)
+  python -m learning.image_train --kind cnn --image-dir images_cropmask --color gray   # 흑백으로 학습
 
 분할은 posture_dataset.load_splits(images_only=True)로 다른 방식과 동일하게 한다.
 GPU가 있으면 자동으로 사용한다 (CPU로도 가능하지만 느림).
@@ -21,7 +22,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from evaluation.eval_metrics import balanced_acc, confusion, format_cm
-from learning.image_model import FrameDataset, build, image_probs, save_image_model
+from learning.image_model import COLOR_MODES, FrameDataset, build, image_probs, save_image_model
 from learning.labels import DEFAULT, SCHEMES, classes
 from learning.posture_dataset import load_splits
 
@@ -36,6 +37,8 @@ def parse_args():
                     help="라벨 체계: merged = 거북목·구부정 합침 (기본), fine = 5개 그대로")
     ap.add_argument("--image-dir", default="images",
                     help="이미지 폴더: images = 원본 (기본), images_crop = 사람 영역 crop")
+    ap.add_argument("--color", choices=COLOR_MODES, default="basic",
+                    help="색 처리: basic (기존), jitter = 색조 변경·흑백 섞기, gray = 항상 흑백")
     ap.add_argument("--epochs", type=int, default=15)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--batch", type=int, default=32)
@@ -91,15 +94,16 @@ def main():
         raise SystemExit(f"{args.image_dir} 이미지 {len(missing)}장이 없습니다 (예: {missing[0]}). "
                          f"python -m learning.crop_images를 먼저 실행하세요.")
     print(f"[{args.kind}] 학습 {len(train_split)}장 (비율 {args.train_fraction:.0%}) / "
-          f"검증 {len(val_split)}장, 이미지 {args.image_dir}, device={device}")
+          f"검증 {len(val_split)}장, 이미지 {args.image_dir}, 색 {args.color}, device={device}")
 
     mean, std = num_stats(train_split.X)
     loader = lambda s, train: DataLoader(                           # noqa: E731
-        FrameDataset(s, mean, std, train), batch_size=args.batch, shuffle=train,
+        FrameDataset(s, mean, std, train, args.color), batch_size=args.batch, shuffle=train,
         num_workers=args.workers, pin_memory=(device == "cuda"))
     train_loader, val_loader = loader(train_split, True), loader(val_split, False)
 
-    model = build(args.kind, pretrained=not args.no_pretrained, n_cls=n_cls).to(device)
+    model = build(args.kind, pretrained=not args.no_pretrained, n_cls=n_cls,
+                  gray=args.color == "gray").to(device)
     loss_fn = nn.CrossEntropyLoss(weight=class_weight_tensor(train_split.y, n_cls).to(device))
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
@@ -120,7 +124,7 @@ def main():
     print("\n" + format_cm(confusion(val_split.y, pred, n_cls), f"검증 · {args.kind}", names))
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    save_image_model(args.out, args.kind, model.cpu(), mean, std, names, args.image_dir)
+    save_image_model(args.out, args.kind, model.cpu(), mean, std, names, args.image_dir, args.color)
     print(f"\n저장: {args.out}  (최종 비교는 evaluation.compare로 테스트 세트에서)")
 
 

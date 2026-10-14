@@ -1,0 +1,18 @@
+# Python 캐시
+__pycache__/
+*.py[cod]
+
+# 수집 데이터 (얼굴 이미지 포함, 용량 큼)
+data/
+data_old/
+eval/
+check_data/
+
+# 학습 결과 모델
+models/
+
+# MediaPipe 모델 파일 (wget으로 다시 받을 수 있음)
+*.task
+
+# 이전 버전 보관
+old/

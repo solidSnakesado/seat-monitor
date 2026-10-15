@@ -5,7 +5,10 @@
   python -m learning.posture_train --images-only         # 네 방식 비교용: 이미지 있는 프레임만 (같은 데이터)
   python -m learning.posture_train --train-fraction 0.25 --out models/mlp_25.pt   # 데이터 효율 실험
   python -m learning.posture_train --labels fine         # 거북목·구부정을 나눈 5개 라벨로 학습
+  python -m learning.posture_train --offset-aug 1.0      # 기준 자세 오차에 둔감하게 (오프셋 증강)
 
+오프셋 증강: 기준 자세를 저장할 때 몸이 조금 기울어 있으면 모든 수치가 일정하게 어긋난다.
+학습 때 수치에 무작위 오프셋을 더해, 작은 어긋남은 자세 변화로 보지 않도록 만든다.
 분할은 posture_dataset.load_splits()로 다른 방식과 동일하게 한다.
 최종 비교(테스트 세트)는 evaluation/compare.py에서 한다. 여기서는 검증 세트로 모델만 고른다.
 """
@@ -19,7 +22,10 @@ import torch.nn as nn
 from evaluation.eval_metrics import balanced_acc, confusion, format_cm, rule_predict
 from learning.labels import DEFAULT, SCHEMES, classes
 from learning.posture_dataset import load_splits
-from learning.posture_model import PostureMLP, mlp_probs, save_model
+from learning.posture_model import INPUTS, PostureMLP, mlp_probs, save_model
+
+# --offset-aug 1.0일 때 더할 오프셋의 최대 크기 (실제로 관찰된 어긋남: 어깨 기울기 3.2°, 어깨 높이 0.031)
+OFFSET = {"ear_shoulder": 0.03, "head_ratio": 0.03, "shoulder_y": 0.03, "shoulder_tilt": 3.0, "ear_tilt": 3.0}
 
 
 def parse_args():
@@ -34,6 +40,8 @@ def parse_args():
     ap.add_argument("--val-ratio", type=float, default=0.2)
     ap.add_argument("--images-only", action="store_true", help="이미지가 있는 프레임만 사용")
     ap.add_argument("--train-fraction", type=float, default=1.0, help="학습 데이터 사용 비율")
+    ap.add_argument("--offset-aug", type=float, default=0.0,
+                    help="오프셋 증강 배율 (0 = 사용 안 함, 1.0 = 기울기 ±3°, 비율·어깨 높이 ±0.03)")
     return ap.parse_args()
 
 
@@ -43,12 +51,14 @@ def class_weight_tensor(y, n):
     return torch.tensor(w, dtype=torch.float32)
 
 
-def train(train_split, val_split, epochs, lr, n_cls):
+def train(train_split, val_split, epochs, lr, n_cls, offset_aug=0.0):
     Xtr, ytr = train_split.X, train_split.y
     mean, std = Xtr.mean(0), Xtr.std(0)
     std[std < 1e-6] = 1.0
     xt = torch.tensor((Xtr - mean) / std, dtype=torch.float32)
     yt = torch.tensor(ytr)
+    off = np.array([OFFSET[k] for k in INPUTS], dtype=np.float32) * offset_aug / std
+    off = torch.tensor(off, dtype=torch.float32)              # 정규화된 단위로 바꾼 오프셋 최대 크기
 
     model = PostureMLP(n_cls=n_cls)
     loss_fn = nn.CrossEntropyLoss(weight=class_weight_tensor(ytr, n_cls))
@@ -59,8 +69,11 @@ def train(train_split, val_split, epochs, lr, n_cls):
         perm = torch.randperm(len(yt))
         for i in range(0, len(yt), 64):
             idx = perm[i:i + 64]
+            xb = xt[idx]
+            if offset_aug > 0:                                 # 프레임마다 -off ~ +off 균등 분포
+                xb = xb + (torch.rand_like(xb) * 2 - 1) * off
             opt.zero_grad()
-            loss = loss_fn(model(xt[idx]), yt[idx])
+            loss = loss_fn(model(xb), yt[idx])
             loss.backward()
             opt.step()
         model.eval()
@@ -83,8 +96,10 @@ def main():
     train_split = train_split.fraction(args.train_fraction)
     print(f"학습에 사용: {len(train_split)} 프레임 (비율 {args.train_fraction:.0%})")
     print("학습 클래스별:", dict(zip(names, np.bincount(train_split.y, minlength=len(names)).tolist())))
+    if args.offset_aug > 0:
+        print("오프셋 증강:", {k: round(v * args.offset_aug, 3) for k, v in OFFSET.items()})
 
-    model, mean, std = train(train_split, val_split, args.epochs, args.lr, len(names))
+    model, mean, std = train(train_split, val_split, args.epochs, args.lr, len(names), args.offset_aug)
     mlp_pred = mlp_probs(model, mean, std, val_split.X).argmax(1)
     rule_pred = rule_predict(val_split.X, scheme=args.labels)
     print("\n" + format_cm(confusion(val_split.y, rule_pred, len(names)), "검증 · 규칙", names))

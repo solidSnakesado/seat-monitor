@@ -2,9 +2,9 @@
 
   A 규칙       : MediaPipe 특징 + 임계값            (학습 없음)
   B 수치 MLP   : MediaPipe 특징 5개 → MLP           (models/posture_mlp.pt)
-  C 이미지 CNN : 이미지 → MobileNetV3              (models/cnn.pt)
+  C 이미지 CNN : 이미지 → MobileNetV3              (models/cnn.pt, 여러 개면 확률 평균 = 이미지 앙상블)
   D 융합       : 이미지 + 수치 → 하나의 모델        (models/fusion.pt)
-  E 결과 융합  : B와 C의 확률 평균                  (B, C가 있으면 자동)
+  E 결과 융합  : (1 - w) × B 확률 + w × C 확률      (B, C가 있으면 자동, w = --img-weight, 기본 0.5)
   F 각도 보정  : E의 판정을 귀 기울기 각도로 보정    (E가 있으면 자동)
     F1: E가 바른 자세라고 했는데 귀 기울기가 10° 이상이면 → 고개 기울임
     F2: 목이 꺾인 정도(귀 기울기 - 어깨 기울기)가 10° 이상이면 → 고개 기울임
@@ -12,6 +12,8 @@
 프로젝트 루트(~/dev_ws/mediaPipe)에서 실행:
   python -m evaluation.compare                  # 라벨 merged (거북목·구부정 합침, 기본)
   python -m evaluation.compare --labels fine    # 5개 라벨 그대로
+  python -m evaluation.compare --mlp models/v6/posture_mlp.pt --cnn models/v6/cnn_cropmask_reg.pt \
+      models/v6/cnn_sil.pt --img-weight 0.6 --fusion ""      # 이미지 앙상블 + 이미지 비중 0.6
 5개 라벨로 학습한 모델도 merged로 평가할 수 있다 (거북목·구부정 확률을 더함).
 결과는 화면과 results/compare_날짜_시간.md 에 저장된다.
 """
@@ -39,8 +41,10 @@ def parse_args():
     ap = argparse.ArgumentParser(description="규칙 / 수치 / 이미지 / 융합 비교")
     ap.add_argument("--data", default=str(root / "data"))
     ap.add_argument("--mlp", default=str(root / "models" / "posture_mlp.pt"))
-    ap.add_argument("--cnn", default=str(root / "models" / "cnn.pt"))
+    ap.add_argument("--cnn", nargs="+", default=[str(root / "models" / "cnn.pt")],
+                    help="이미지 모델 (여러 개면 확률 평균 = 이미지 앙상블)")
     ap.add_argument("--fusion", default=str(root / "models" / "fusion.pt"))
+    ap.add_argument("--img-weight", type=float, default=0.5, help="E의 이미지 비중 w (0 = B만, 1 = C만)")
     ap.add_argument("--out", default=str(root / "results"))
     ap.add_argument("--labels", choices=list(SCHEMES), default=DEFAULT,
                     help="라벨 체계: merged = 거북목·구부정 합침 (기본), fine = 5개 그대로")
@@ -76,49 +80,57 @@ def converted(name, probs, model_classes, scheme):
     return p
 
 
+def image_result(name, path, test, sc, n, notes):
+    """이미지 모델 하나 → (확률, ms/프레임, KB). 파일·이미지가 없으면 None"""
+    if not path or not Path(path).is_file():
+        return None
+    model, _, mean, std, icls, idir = load_image_model(path, "cpu")
+    split = test.with_image_dir(idir)                 # 모델이 학습한 이미지 종류로 평가 (crop / 실루엣 등)
+    if split.missing_images():
+        print(f"{name}: {idir} 이미지가 없어 제외합니다 (python -m learning.crop_images 실행 필요)")
+        return None
+    ds = FrameDataset(split, mean, std, train=False)
+    p = converted(name, image_probs(model, DataLoader(ds, batch_size=64)), icls, sc)
+    if p is None:
+        return None
+    notes.append(f"{name}: {path} (이미지 {idir})")
+
+    def one(i):
+        img, num, _ = ds[i]
+        with torch.no_grad():
+            model(img[None], num[None])
+    return p, time_per_frame(one, n), file_kb(path)
+
+
 def evaluate(args, test, notes):
     """→ {방식 이름: (확률 또는 None, 예측, ms/프레임, 모델 KB)}. notes에 모델·입력 정보를 남긴다"""
     n, sc = min(args.timing_frames, len(test)), args.labels
     ms = time_per_frame(lambda i: rule_predict(test.X[i:i + 1], scheme=sc), n)
-    res = {"A 규칙": (None, rule_predict(test.X, scheme=sc), ms, 0.0)}
-
-    probs = {}
+    res, probs = {"A 규칙": (None, rule_predict(test.X, scheme=sc), ms, 0.0)}, {}
     if args.mlp and Path(args.mlp).is_file():
         m, mean, std, mcls = load_mlp(args.mlp)
         p = converted("B 수치 MLP", mlp_probs(m, mean, std, test.X), mcls, sc)
         if p is not None:
             notes.append(f"B 수치 MLP: {args.mlp}")
-            probs["B 수치 MLP"] = p
             ms = time_per_frame(lambda i: mlp_probs(m, mean, std, test.X[i:i + 1]), n)
-            res["B 수치 MLP"] = (p, p.argmax(1), ms, file_kb(args.mlp))
+            res["B 수치 MLP"] = probs["B"] = (p, p.argmax(1), ms, file_kb(args.mlp))
 
-    for name, path in (("C 이미지 CNN", args.cnn), ("D 융합", args.fusion)):
-        if not path or not Path(path).is_file():
-            continue
-        model, _, mean, std, icls, idir = load_image_model(path, "cpu")
-        split = test.with_image_dir(idir)             # 모델이 학습한 이미지 종류로 평가 (원본 / crop)
-        if split.missing_images():
-            print(f"{name}: {idir} 이미지가 없어 제외합니다 (python -m learning.crop_images 실행 필요)")
-            continue
-        notes.append(f"{name}: {path} (이미지 {idir})")
-        ds = FrameDataset(split, mean, std, train=False)
-        p = converted(name, image_probs(model, DataLoader(ds, batch_size=64)), icls, sc)
-        if p is None:
-            continue
-        probs[name] = p
+    cs = [r for r in (image_result("C 이미지 CNN", p, test, sc, n, notes) for p in args.cnn) if r]
+    if cs:                                            # 여러 개면 확률 평균, 처리 시간·크기는 합
+        p = np.mean([r[0] for r in cs], axis=0)
+        name = "C 이미지 CNN" if len(cs) == 1 else f"C 이미지 앙상블({len(cs)}개)"
+        res[name] = probs["C"] = (p, p.argmax(1), sum(r[1] for r in cs), sum(r[2] for r in cs))
+    d = image_result("D 융합", args.fusion, test, sc, n, notes)
+    if d:
+        res["D 융합"] = (d[0], d[0].argmax(1), d[1], d[2])
 
-        def one(i, model=model, ds=ds):
-            img, num, _ = ds[i]
-            with torch.no_grad():
-                model(img[None], num[None])
-        res[name] = (p, p.argmax(1), time_per_frame(one, n), file_kb(path))
-
-    if "B 수치 MLP" in probs and "C 이미지 CNN" in probs:
-        p = (probs["B 수치 MLP"] + probs["C 이미지 CNN"]) / 2
-        ms = res["B 수치 MLP"][2] + res["C 이미지 CNN"][2]
-        res["E 결과 융합(B+C)"] = (p, p.argmax(1), ms, res["B 수치 MLP"][3] + res["C 이미지 CNN"][3])
+    if "B" in probs and "C" in probs:
+        (pb, _, msb, kbb), (pc, _, msc, kbc), w = probs["B"], probs["C"], args.img_weight
+        p = (1 - w) * pb + w * pc
+        notes.append(f"E 결과 융합: 이미지 비중 w = {w:g}")
+        res[f"E 결과 융합(B+C, w={w:g})"] = (p, p.argmax(1), msb + msc, kbb + kbc)
         for name, pred in angle_override(p.argmax(1), test.X, classes(sc)).items():
-            res[name] = (None, pred, ms, res["E 결과 융합(B+C)"][3])
+            res[name] = (None, pred, msb + msc, kbb + kbc)
     return res
 
 
@@ -158,7 +170,7 @@ def main():
     if len(test) == 0:                       # 수치만 수집한 경우: 전체 프레임으로 A, B만 비교
         print("이미지가 있는 프레임이 없어 전체 프레임으로 비교합니다 (이미지 모델 C, D, E 제외)")
         _, _, test = load_splits(args.data, images_only=False, scheme=args.labels)
-        args.cnn = args.fusion = ""
+        args.cnn, args.fusion = [], ""
     if len(test) == 0:
         raise SystemExit("테스트할 프레임이 없습니다.")
     counts = dict(zip(names, np.bincount(test.y, minlength=len(names)).tolist()))

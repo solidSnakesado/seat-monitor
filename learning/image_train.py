@@ -8,6 +8,12 @@
   python -m learning.image_train --kind cnn --image-dir images_crop   # 사람 영역 crop 이미지로 학습
                                                           # (먼저 python -m learning.crop_images)
   python -m learning.image_train --kind cnn --image-dir images_cropmask --color gray   # 흑백으로 학습
+  python -m learning.image_train --kind cnn --image-dir images_sil --freeze 9 --label-smoothing 0.1 --erase 0.5
+
+외우기 억제 옵션 (적은 데이터에서 학습 데이터를 통째로 외우는 것을 막음, 지정하지 않으면 사용 안 함):
+  --freeze N          백본(MobileNetV3, 블록 13개) 앞쪽 N블록은 사전학습 그대로 고정, 뒤쪽만 학습
+  --label-smoothing   정답 확률을 1.0 대신 조금 낮춰 학습 (과도한 확신 방지)
+  --erase P           학습 이미지의 일부를 확률 P로 검게 가림 (한 부위만 보고 판정하지 않게)
 
 분할은 posture_dataset.load_splits(images_only=True)로 다른 방식과 동일하게 한다.
 GPU가 있으면 자동으로 사용한다 (CPU로도 가능하지만 느림).
@@ -44,8 +50,14 @@ def parse_args():
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--val-ratio", type=float, default=0.2)
+    ap.add_argument("--val-sessions", nargs="+", default=None,
+                    help="통째로 검증에 쓸 세션 (파일 이름 일부, 예: round_stripe). 지정하면 --val-ratio 무시")
     ap.add_argument("--train-fraction", type=float, default=1.0)
     ap.add_argument("--no-pretrained", action="store_true", help="사전학습 가중치 없이 처음부터 학습")
+    ap.add_argument("--freeze", type=int, default=0, help="백본 앞쪽 N블록 고정 (0~13, 0 = 전부 학습)")
+    ap.add_argument("--label-smoothing", type=float, default=0.0, help="라벨 스무딩 (예: 0.1)")
+    ap.add_argument("--erase", type=float, default=0.0, help="무작위 가리기 확률 (예: 0.5)")
+    ap.add_argument("--seed", type=int, default=0, help="난수 시드 (같은 설정으로 여러 모델을 만들어 앙상블할 때 변경)")
     args = ap.parse_args()
     args.out = args.out or str(root / "models" / f"{args.kind}.pt")
     return args
@@ -63,8 +75,19 @@ def class_weight_tensor(y, n):
     return torch.tensor(w, dtype=torch.float32)
 
 
-def run_epoch(model, loader, loss_fn, opt, device):
+def freeze_blocks(model, n):
+    """백본 앞쪽 n블록의 가중치와 BatchNorm 통계를 고정 → 고정한 블록 목록"""
+    blocks = list(model.features[0][:n])
+    for blk in blocks:
+        for p in blk.parameters():
+            p.requires_grad = False
+    return blocks
+
+
+def run_epoch(model, loader, loss_fn, opt, device, frozen=()):
     model.train()
+    for blk in frozen:                     # 고정 블록은 BatchNorm 통계도 바뀌지 않게 평가 모드
+        blk.eval()
     total, n = 0.0, 0
     for img, num, y in loader:
         img, num, y = img.to(device), num.to(device), y.to(device)
@@ -79,11 +102,12 @@ def run_epoch(model, loader, loss_fn, opt, device):
 
 def main():
     args = parse_args()
-    torch.manual_seed(0)
+    torch.manual_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     names = classes(args.labels)
     n_cls = len(names)
-    train_split, val_split, _ = load_splits(args.data, args.val_ratio, images_only=True, scheme=args.labels)
+    train_split, val_split, _ = load_splits(args.data, args.val_ratio, images_only=True, scheme=args.labels,
+                                            val_sessions=args.val_sessions)
     train_split = train_split.fraction(args.train_fraction).with_image_dir(args.image_dir)
     val_split = val_split.with_image_dir(args.image_dir)
     if len(train_split) == 0:
@@ -95,23 +119,26 @@ def main():
                          f"python -m learning.crop_images를 먼저 실행하세요.")
     print(f"[{args.kind}] 학습 {len(train_split)}장 (비율 {args.train_fraction:.0%}) / "
           f"검증 {len(val_split)}장, 이미지 {args.image_dir}, 색 {args.color}, device={device}")
+    print(f"외우기 억제: 고정 {args.freeze}블록, 라벨 스무딩 {args.label_smoothing}, 가리기 {args.erase}")
 
     mean, std = num_stats(train_split.X)
     loader = lambda s, train: DataLoader(                           # noqa: E731
-        FrameDataset(s, mean, std, train, args.color), batch_size=args.batch, shuffle=train,
-        num_workers=args.workers, pin_memory=(device == "cuda"))
+        FrameDataset(s, mean, std, train, args.color, args.erase if train else 0.0),
+        batch_size=args.batch, shuffle=train, num_workers=args.workers, pin_memory=(device == "cuda"))
     train_loader, val_loader = loader(train_split, True), loader(val_split, False)
 
     model = build(args.kind, pretrained=not args.no_pretrained, n_cls=n_cls,
                   gray=args.color == "gray").to(device)
-    loss_fn = nn.CrossEntropyLoss(weight=class_weight_tensor(train_split.y, n_cls).to(device))
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    frozen = freeze_blocks(model, args.freeze)
+    loss_fn = nn.CrossEntropyLoss(weight=class_weight_tensor(train_split.y, n_cls).to(device),
+                                  label_smoothing=args.label_smoothing)
+    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
 
     best, best_state = -1.0, None
     for ep in range(1, args.epochs + 1):
         t0 = time.time()
-        loss = run_epoch(model, train_loader, loss_fn, opt, device)
+        loss = run_epoch(model, train_loader, loss_fn, opt, device, frozen)
         sched.step()
         pred = image_probs(model, val_loader, device).argmax(1)
         score = balanced_acc(confusion(val_split.y, pred, n_cls))

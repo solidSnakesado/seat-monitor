@@ -2,11 +2,13 @@
 
 이미지 모델이 배경·장소나 화면 속 위치를 외우지 않도록, 어깨 폭을 기준으로 상반신만 잘라낸다.
 --mask를 주면 MediaPipe의 사람 윤곽(segmentation mask)으로 사람 밖을 검은색으로 칠한 뒤 자른다.
+--silhouette를 주면 사람 윤곽만 흑백(사람 = 흰색, 배경 = 검은색)으로 저장한다. 옷의 색·무늬·질감이 모두 사라진다.
 원본 이미지는 그대로 두고, 같은 이름으로 <CSV 폴더>/<폴더>/<세션>/000123.jpg 에 저장한다.
 
 프로젝트 루트(~/dev_ws/mediaPipe)에서 실행:
   python -m learning.crop_images                   # crop만       → images_crop/
   python -m learning.crop_images --mask            # 배경 제거 + crop → images_cropmask/
+  python -m learning.crop_images --silhouette      # 윤곽만 + crop    → images_sil/
   python -m learning.crop_images --roots data      # 특정 폴더만
 이후 학습·비교: python -m learning.image_train --kind cnn --image-dir images_crop (또는 images_cropmask)
 """
@@ -32,11 +34,15 @@ def parse_args():
     ap.add_argument("--roots", nargs="+", default=[str(root / "data"), str(root / "eval")],
                     help="세션 CSV를 찾을 폴더 (하위 폴더 포함)")
     ap.add_argument("--model", default=str(root / "assets" / "pose_landmarker_lite.task"))
-    ap.add_argument("--mask", action="store_true", help="사람 밖 배경을 검은색으로 칠한 뒤 자르기")
-    ap.add_argument("--out-name", default="", help="저장 폴더 이름 (기본: images_crop / images_cropmask)")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--mask", action="store_true", help="사람 밖 배경을 검은색으로 칠한 뒤 자르기")
+    mode.add_argument("--silhouette", action="store_true", help="사람 윤곽만 흑백으로 저장")
+    ap.add_argument("--out-name", default="",
+                    help="저장 폴더 이름 (기본: images_crop / images_cropmask / images_sil)")
     ap.add_argument("--overwrite", action="store_true", help="이미 만든 이미지도 다시 만들기")
     args = ap.parse_args()
-    args.out_name = args.out_name or ("images_cropmask" if args.mask else "images_crop")
+    args.out_name = args.out_name or ("images_sil" if args.silhouette else
+                                      "images_cropmask" if args.mask else "images_crop")
     return args
 
 
@@ -75,6 +81,14 @@ def apply_mask(img, mask):
     return (img.astype(np.float32) * m).astype(np.uint8)
 
 
+def to_silhouette(img, mask):
+    """사람 윤곽(0~1) → 흑백 3채널 이미지. 윤곽이 아직 없으면 전부 검은색"""
+    if mask is None:
+        return np.zeros_like(img)
+    m = (np.clip(np.squeeze(mask).astype(np.float32), 0.0, 1.0) * 255).astype(np.uint8)
+    return cv2.cvtColor(m, cv2.COLOR_GRAY2BGR)
+
+
 def crop(img, box):
     """영역이 화면 밖으로 나가면 검은색으로 채운 뒤 잘라서 160×120으로 맞춘다"""
     h, w = img.shape[:2]
@@ -86,7 +100,7 @@ def crop(img, box):
     return cv2.resize(img[y0:y1, x0:x1], (OUT_W, OUT_H), interpolation=cv2.INTER_LINEAR)
 
 
-def process_session(csv_path, detector, out_name, overwrite, use_mask=False):
+def process_session(csv_path, detector, out_name, overwrite, use_mask=False, silhouette=False):
     """세션 하나 처리 → (검출 성공, 이전 위치 사용, 원본 없음, 건너뜀) 장 수"""
     with open(csv_path, newline="") as f:
         rels = [r["image"] for r in csv.DictReader(f) if r.get("image")]
@@ -112,11 +126,13 @@ def process_session(csv_path, detector, out_name, overwrite, use_mask=False):
         else:
             last = box
             ok += 1
-        if use_mask:
+        if use_mask or silhouette:
             masks = getattr(res, "segmentation_masks", None)
             if masks:
                 last_mask = masks[0].numpy_view()
-            if last_mask is not None:
+            if silhouette:
+                img = to_silhouette(img, last_mask)
+            elif last_mask is not None:
                 img = apply_mask(img, last_mask)
         dst.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(dst), crop(img, box), [cv2.IMWRITE_JPEG_QUALITY, 90])
@@ -129,11 +145,11 @@ def main():
                     for p in Path(r).rglob("posture_session_*.csv")})
     if not files:
         raise SystemExit(f"세션 CSV가 없습니다: {args.roots}")
-    detector = make_detector(args.model, args.mask)
+    detector = make_detector(args.model, args.mask or args.silhouette)
     try:
         for p in files:
             ok, reused, missing, skipped = process_session(p, detector, args.out_name,
-                                                           args.overwrite, args.mask)
+                                                           args.overwrite, args.mask, args.silhouette)
             print(f"{p.parent.name}/{p.stem[16:]:<28} 검출 {ok:5d}장  이전 위치 사용 {reused:4d}장  "
                   f"원본 없음 {missing:3d}장  이미 있음 {skipped:5d}장")
     finally:

@@ -38,6 +38,8 @@ def parse_args():
     ap.add_argument("--epochs", type=int, default=80)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--val-ratio", type=float, default=0.2)
+    ap.add_argument("--val-sessions", nargs="+", default=None,
+                    help="통째로 검증에 쓸 세션 (파일 이름 일부, 예: round_stripe). 지정하면 --val-ratio 무시")
     ap.add_argument("--images-only", action="store_true", help="이미지가 있는 프레임만 사용")
     ap.add_argument("--train-fraction", type=float, default=1.0, help="학습 데이터 사용 비율")
     ap.add_argument("--offset-aug", type=float, default=0.0,
@@ -92,7 +94,8 @@ def main():
     args = parse_args()
     torch.manual_seed(0)
     names = classes(args.labels)
-    train_split, val_split, _ = load_splits(args.data, args.val_ratio, args.images_only, scheme=args.labels)
+    train_split, val_split, _ = load_splits(args.data, args.val_ratio, args.images_only, scheme=args.labels,
+                                            val_sessions=args.val_sessions)
     train_split = train_split.fraction(args.train_fraction)
     print(f"학습에 사용: {len(train_split)} 프레임 (비율 {args.train_fraction:.0%})")
     print("학습 클래스별:", dict(zip(names, np.bincount(train_split.y, minlength=len(names)).tolist())))

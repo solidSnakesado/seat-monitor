@@ -79,24 +79,27 @@ def build(kind, pretrained=True, n_cls=len(CLASSES), gray=False):
     return net(pretrained, n_cls=n_cls, gray=gray)
 
 
-def make_transform(train, color="basic"):
-    aug = []
+def make_transform(train, color="basic", erase=0.0):
+    """erase: 무작위 가리기 확률 (학습 때만). 이미지 일부를 검게 가려 한 부분만 외우지 못하게 함"""
+    aug, post = [], []
     if train:
         jitter = color == "jitter"
         aug = [T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.5 if jitter else 0.2,
                              hue=0.5 if jitter else 0.0)]
         if jitter:
             aug.append(T.RandomGrayscale(p=0.3))
-    return T.Compose([T.Resize(IMG_HW), *aug, T.ToTensor(), T.Normalize(MEAN, STD)])
+        if erase > 0:
+            post = [T.RandomErasing(p=erase, scale=(0.02, 0.15), value=0)]
+    return T.Compose([T.Resize(IMG_HW), *aug, T.ToTensor(), T.Normalize(MEAN, STD), *post])
 
 
 class FrameDataset(Dataset):
     """Split → (이미지 텐서, 정규화된 수치, 라벨)"""
 
-    def __init__(self, split, num_mean, num_std, train, color="basic"):
+    def __init__(self, split, num_mean, num_std, train, color="basic", erase=0.0):
         self.split = split
         self.num = ((split.X - num_mean) / num_std).astype(np.float32)
-        self.tf = make_transform(train, color)
+        self.tf = make_transform(train, color, erase)
 
     def __len__(self):
         return len(self.split)

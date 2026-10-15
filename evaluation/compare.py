@@ -5,6 +5,9 @@
   C 이미지 CNN : 이미지 → MobileNetV3              (models/cnn.pt)
   D 융합       : 이미지 + 수치 → 하나의 모델        (models/fusion.pt)
   E 결과 융합  : B와 C의 확률 평균                  (B, C가 있으면 자동)
+  F 각도 보정  : E의 판정을 귀 기울기 각도로 보정    (E가 있으면 자동)
+    F1: E가 바른 자세라고 했는데 귀 기울기가 10° 이상이면 → 고개 기울임
+    F2: 목이 꺾인 정도(귀 기울기 - 어깨 기울기)가 10° 이상이면 → 고개 기울임
 
 프로젝트 루트(~/dev_ws/mediaPipe)에서 실행:
   python -m evaluation.compare                  # 라벨 merged (거북목·구부정 합침, 기본)
@@ -21,11 +24,14 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+from common.posture_judge import Thresholds
 from evaluation.eval_metrics import balanced_acc, confusion, format_cm, macro_f1, recalls, rule_predict
 from learning.image_model import FrameDataset, image_probs, load_image_model
 from learning.labels import DEFAULT, SCHEMES, classes, convert_probs, ko_names
 from learning.posture_dataset import load_splits
-from learning.posture_model import load_mlp, mlp_probs
+from learning.posture_model import INPUTS, load_mlp, mlp_probs
+
+EAR, SHOULDER = INPUTS.index("ear_tilt"), INPUTS.index("shoulder_tilt")
 
 
 def parse_args():
@@ -53,6 +59,14 @@ def time_per_frame(fn, n):
 
 def file_kb(path):
     return Path(path).stat().st_size / 1024 if path and Path(path).exists() else 0.0
+
+
+def angle_override(pred, X, names):
+    """E 예측 + 귀 기울기 각도 보정 → {방식 이름: 예측}. 고개 기울임은 각도로 직접 측정되는 자세라서"""
+    good, head, deg = names.index("good"), names.index("head_tilt"), Thresholds().head_tilt_deg
+    ear, neck = np.abs(X[:, EAR]), np.abs(X[:, EAR] - X[:, SHOULDER])
+    return {"F1 각도 보정(바른→기울임)": np.where((pred == good) & (ear >= deg), head, pred),
+            "F2 각도 보정(목 꺾임)": np.where(neck >= deg, head, pred)}
 
 
 def converted(name, probs, model_classes, scheme):
@@ -103,6 +117,8 @@ def evaluate(args, test, notes):
         p = (probs["B 수치 MLP"] + probs["C 이미지 CNN"]) / 2
         ms = res["B 수치 MLP"][2] + res["C 이미지 CNN"][2]
         res["E 결과 융합(B+C)"] = (p, p.argmax(1), ms, res["B 수치 MLP"][3] + res["C 이미지 CNN"][3])
+        for name, pred in angle_override(p.argmax(1), test.X, classes(sc)).items():
+            res[name] = (None, pred, ms, res["E 결과 융합(B+C)"][3])
     return res
 
 

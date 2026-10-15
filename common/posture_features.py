@@ -24,7 +24,9 @@ FEATURE_NAMES = ("ear_shoulder", "head_ratio", "shoulder_y", "shoulder_tilt", "e
 # 2단계: 랜드마크 검출
 # ------------------------------------------------------------
 class PoseDetector:
-    def __init__(self, model_path):
+    """masks=True면 사람 윤곽(0~1, 프레임과 같은 크기)도 계산해 self.mask에 둔다 (이미지 모델 전처리용)"""
+
+    def __init__(self, model_path, masks=False):
         path = Path(model_path)
         if not path.exists():
             raise FileNotFoundError(f"{path} 없음. 파일 상단의 wget 명령으로 받으세요.")
@@ -33,9 +35,11 @@ class PoseDetector:
             base_options=mp.tasks.BaseOptions(model_asset_path=str(path.resolve())),
             running_mode=vision.RunningMode.VIDEO,
             num_poses=1,
+            output_segmentation_masks=masks,
         )
         self._landmarker = vision.PoseLandmarker.create_from_options(options)
         self._last_ts = 0
+        self.mask = None
 
     def detect(self, frame_bgr):
         """→ 33개 랜드마크 리스트, 사람이 없으면 None"""
@@ -44,6 +48,8 @@ class PoseDetector:
         ts = max(self._last_ts + 1, int(time.monotonic() * 1000))   # VIDEO 모드: 증가하는 타임스탬프
         self._last_ts = ts
         result = self._landmarker.detect_for_video(image, ts)
+        masks = getattr(result, "segmentation_masks", None)
+        self.mask = masks[0].numpy_view().copy() if masks else None
         return result.pose_landmarks[0] if result.pose_landmarks else None
 
     def close(self):

@@ -5,6 +5,9 @@
   python -m evaluation.face_compare --test --dir models/face/v1                   # 테스트 세션 (마지막에 한 번만)
 
 --dir 안의 mlp.pt(B), cnn.pt(C), fusion.pt(D)를 읽는다. 없는 모델은 건너뛴다.
+--cnn / --fusion으로 모델 파일을 직접 고를 수 있고, 여러 개를 주면 확률을 평균한다 (seed 앙상블):
+  python -m evaluation.face_compare --val-sessions val --dir models/face/v1 \
+      --cnn models/face/v1/cnn_ls_erase.pt models/face/v1/cnn_ls_erase_s1.pt --img-weight 0.4 --note "C 스무딩+가리기 2개"
 E = (1 − w) × B + w × C (--img-weight w, B·C가 모두 있을 때).
 모든 방식을 얼굴 이미지가 있는 프레임(3프레임마다)으로 맞춰 평가한다.
 결과: 화면 출력 + results/compare_face_날짜_시간.md (results/**/compare_*.md는 git 제외)
@@ -34,6 +37,8 @@ def parse_args():
     ap.add_argument("--dir", default=str(root / "models" / "face"), help="mlp.pt, cnn.pt, fusion.pt가 있는 폴더")
     ap.add_argument("--val-sessions", nargs="+", default=None, help="비교에 쓸 검증 세션 (파일 이름 일부)")
     ap.add_argument("--test", action="store_true", help="검증 대신 테스트 세션(_test)으로 비교")
+    ap.add_argument("--cnn", nargs="+", default=None, help="C 이미지 모델 파일 (여러 개면 평균, 기본: --dir/cnn.pt)")
+    ap.add_argument("--fusion", nargs="+", default=None, help="D 융합 모델 파일 (여러 개면 평균, 기본: --dir/fusion.pt)")
     ap.add_argument("--img-weight", type=float, default=0.5, help="E 결과 결합의 이미지 비중 w")
     ap.add_argument("--out", default=str(root / "results"))
     ap.add_argument("--note", default="", help="히스토리에 남길 단계 이름 (예: 확인용 1세션)")
@@ -43,30 +48,55 @@ def parse_args():
     return args
 
 
-def predict_all(split, model_dir, w, device):
-    """→ {방식 이름: 확률 또는 예측 (N,)}. A는 예측, 나머지는 확률"""
+def image_model_probs(split, paths, device):
+    """이미지·융합 모델 여러 개의 확률 평균 (seed 앙상블)"""
+    out = []
+    for p in paths:
+        model, _, mean, std = load_face_image_model(p, device)
+        out.append(image_probs(model, face_loader(split, mean, std, False, 64, 2, device=device), device))
+    return np.mean(out, axis=0)
+
+
+def model_paths(given, model_dir, fname):
+    """직접 지정한 파일들, 없으면 --dir의 기본 파일 (있을 때만)"""
+    if given:
+        missing = [p for p in given if not Path(p).exists()]
+        if missing:
+            raise SystemExit(f"모델 파일이 없습니다: {missing[0]}")
+        return list(given)
+    p = Path(model_dir) / fname
+    return [str(p)] if p.exists() else []
+
+
+def predict_all(split, model_dir, w, device, cnn=None, fusion=None):
+    """→ ({방식 이름: 예측 (N,)}, 사용한 모델 설명)"""
     out = {"A MediaPipe만 (규칙)": rule_predict(split.X)}
-    probs = {}
+    probs, used = {}, []
     p = Path(model_dir) / "mlp.pt"
     if p.exists():
         model, mean, std = load_face_mlp(p)
         probs["B 수치 MLP"] = mlp_probs(model, mean, std, split.X)
-    for fname, title in (("cnn.pt", "C 이미지 CNN"), ("fusion.pt", "D 수치+이미지 융합")):
-        p = Path(model_dir) / fname
-        if p.exists():
-            model, _, mean, std = load_face_image_model(p, device)
-            probs[title] = image_probs(model, face_loader(split, mean, std, False, 64, 2, device=device), device)
-    if "B 수치 MLP" in probs and "C 이미지 CNN" in probs:
-        probs[f"E 결과 결합 (이미지 {w:.1f})"] = (1 - w) * probs["B 수치 MLP"] + w * probs["C 이미지 CNN"]
+        used.append(f"B = {p.name}")
+    for paths, key, title in ((model_paths(cnn, model_dir, "cnn.pt"), "C", "C 이미지 CNN"),
+                              (model_paths(fusion, model_dir, "fusion.pt"), "D", "D 수치+이미지 융합")):
+        if paths:
+            name = title + (f" ×{len(paths)}" if len(paths) > 1 else "")
+            probs[name] = image_model_probs(split, paths, device)
+            used.append(f"{key} = {', '.join(Path(x).name for x in paths)}")
+    b = probs.get("B 수치 MLP")
+    c = next((v for k, v in probs.items() if k.startswith("C ")), None)
+    if b is not None and c is not None:
+        probs[f"E 결과 결합 (이미지 {w:.1f})"] = (1 - w) * b + w * c
     out.update({k: v.argmax(1) for k, v in probs.items()})
-    return out
+    return out, "; ".join(used)
 
 
-def report(split, preds, title):
+def report(split, preds, title, used=""):
     names = [FACE_KO[c] for c in FACE_CLASSES]
     n = len(names)
     lines = [f"# 얼굴 판정 비교 — {title}", "",
-             f"프레임 {len(split)} (얼굴 이미지가 있는 프레임), 세션: {', '.join(dict.fromkeys(split.sessions))}", "",
+             f"프레임 {len(split)} (얼굴 이미지가 있는 프레임), 세션: {', '.join(dict.fromkeys(split.sessions))}",
+             f"모델: {used or '-'}", "",
              "## 요약", "", "| 방식 | 균형 정확도 | macro F1 | " + " | ".join(f"{c} 재현율" for c in names) + " |",
              "|---|---|---|" + "---|" * n]
     for k, pred in preds.items():
@@ -132,8 +162,8 @@ def main():
     if missing:
         raise SystemExit(f"얼굴 이미지 {len(missing)}장이 없습니다 (예: {missing[0]})")
     title = "테스트" if args.test else f"검증 ({' '.join(args.val_sessions)})"
-    preds = predict_all(split, args.dir, args.img_weight, device)
-    text = report(split, preds, title)
+    preds, used = predict_all(split, args.dir, args.img_weight, device, args.cnn, args.fusion)
+    text = report(split, preds, title, used)
     print(text)
     Path(args.out).mkdir(parents=True, exist_ok=True)
     out = Path(args.out) / f"compare_face_{datetime.now():%Y%m%d_%H%M%S}.md"

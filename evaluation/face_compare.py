@@ -9,6 +9,7 @@
   python -m evaluation.face_compare --val-sessions val --dir models/face/v1 \
       --cnn models/face/v1/cnn_ls_erase.pt models/face/v1/cnn_ls_erase_s1.pt --img-weight 0.4 --note "C 스무딩+가리기 2개"
 E = (1 − w) × B + w × C (--img-weight w, B·C가 모두 있을 때).
+--zone-gate: E에 영역 연결 적용 (learning.face_dataset.zone_gate). 히스토리의 E 열에 그대로 기록되므로 --note에 적는다.
 모든 방식을 얼굴 이미지가 있는 프레임(3프레임마다)으로 맞춰 평가한다.
 결과: 화면 출력 + results/compare_face_날짜_시간.md (results/**/compare_*.md는 git 제외)
 히스토리: 실행할 때마다 results/face_history.md에 한 줄을 추가한다 (숫자만 있어 git에 포함).
@@ -23,7 +24,7 @@ import torch
 
 from collect.face_guide import FACE_CLASSES, FACE_KO, SUBTAG_KO
 from evaluation.eval_metrics import balanced_acc, confusion, format_cm, macro_f1, recalls
-from learning.face_dataset import false_alarms, load_face_splits, rule_predict
+from learning.face_dataset import false_alarms, load_face_splits, rule_predict, zone_gate
 from learning.face_image_train import face_loader, load_face_image_model
 from learning.face_train import load_face_mlp
 from learning.image_model import image_probs
@@ -39,6 +40,8 @@ def parse_args():
     ap.add_argument("--test", action="store_true", help="검증 대신 테스트 세션(_test)으로 비교")
     ap.add_argument("--cnn", nargs="+", default=None, help="C 이미지 모델 파일 (여러 개면 평균, 기본: --dir/cnn.pt)")
     ap.add_argument("--fusion", nargs="+", default=None, help="D 융합 모델 파일 (여러 개면 평균, 기본: --dir/fusion.pt)")
+    ap.add_argument("--zone-gate", action="store_true",
+                    help="E에서 고개가 화면·강의 공간 범위 안이면 이미지의 '영역 밖' 확률을 '앞 보기'로 옮김")
     ap.add_argument("--img-weight", type=float, default=0.5, help="E 결과 결합의 이미지 비중 w")
     ap.add_argument("--out", default=str(root / "results"))
     ap.add_argument("--note", default="", help="히스토리에 남길 단계 이름 (예: 확인용 1세션)")
@@ -68,7 +71,7 @@ def model_paths(given, model_dir, fname):
     return [str(p)] if p.exists() else []
 
 
-def predict_all(split, model_dir, w, device, cnn=None, fusion=None):
+def predict_all(split, model_dir, w, device, cnn=None, fusion=None, gate=False):
     """→ ({방식 이름: 예측 (N,)}, 사용한 모델 설명)"""
     out = {"A MediaPipe만 (규칙)": rule_predict(split.X)}
     probs, used = {}, []
@@ -86,7 +89,8 @@ def predict_all(split, model_dir, w, device, cnn=None, fusion=None):
     b = probs.get("B 수치 MLP")
     c = next((v for k, v in probs.items() if k.startswith("C ")), None)
     if b is not None and c is not None:
-        probs[f"E 결과 결합 (이미지 {w:.1f})"] = (1 - w) * b + w * c
+        name = f"E 결과 결합 (이미지 {w:.1f}" + (", 영역 연결)" if gate else ")")
+        probs[name] = (1 - w) * b + w * (zone_gate(c, split.X) if gate else c)
     out.update({k: v.argmax(1) for k, v in probs.items()})
     return out, "; ".join(used)
 
@@ -162,7 +166,7 @@ def main():
     if missing:
         raise SystemExit(f"얼굴 이미지 {len(missing)}장이 없습니다 (예: {missing[0]})")
     title = "테스트" if args.test else f"검증 ({' '.join(args.val_sessions)})"
-    preds, used = predict_all(split, args.dir, args.img_weight, device, args.cnn, args.fusion)
+    preds, used = predict_all(split, args.dir, args.img_weight, device, args.cnn, args.fusion, args.zone_gate)
     text = report(split, preds, title, used)
     print(text)
     Path(args.out).mkdir(parents=True, exist_ok=True)

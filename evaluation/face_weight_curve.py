@@ -18,7 +18,7 @@ import torch
 
 from collect.face_guide import FACE_CLASSES
 from evaluation.eval_metrics import balanced_acc, confusion, macro_f1, recalls
-from learning.face_dataset import load_face_splits
+from learning.face_dataset import load_face_splits, zone_gate
 from learning.face_image_train import face_loader, load_face_image_model
 from learning.face_train import load_face_mlp
 from learning.image_model import image_probs
@@ -36,6 +36,7 @@ def parse_args():
     ap.add_argument("--cnn", nargs="+", default=None, help="이미지 모델들 (기본: --dir의 cnn.pt)")
     ap.add_argument("--val-sessions", nargs="+", required=True, help="검증 세션 (파일 이름 일부)")
     ap.add_argument("--step", type=float, default=0.1)
+    ap.add_argument("--zone-gate", action="store_true", help="이미지 확률에 영역 연결 적용 (face_compare와 같음)")
     ap.add_argument("--out", default=str(root / "results"))
     return ap.parse_args()
 
@@ -62,6 +63,8 @@ def main():
         m, _, nm, ns = load_face_image_model(path, device)
         pcs.append(image_probs(m, face_loader(split, nm, ns, False, 64, 2, device=device), device))
     pc = np.mean(pcs, axis=0)
+    if args.zone_gate:
+        pc = zone_gate(pc, split.X)
     conf_b, conf_c = pb.max(1).mean(), pc.max(1).mean()
 
     n = len(FACE_CLASSES)
@@ -72,7 +75,8 @@ def main():
         rows.append((w, balanced_acc(cm), macro_f1(cm), recalls(cm)[AWAY], front_alarm(split, pred)))
     best = max(rows, key=lambda r: r[1])
 
-    lines = [f"# 얼굴 이미지 비중 곡선 — 검증 ({' '.join(args.val_sessions)})", "",
+    gate = " · 영역 연결" if args.zone_gate else ""
+    lines = [f"# 얼굴 이미지 비중 곡선 — 검증 ({' '.join(args.val_sessions)}){gate}", "",
              f"프레임 {len(split)}, 이미지 모델 {len(cnns)}개: {', '.join(Path(c).name for c in cnns)}",
              f"평균 최고 확률 (확신 정도): B {conf_b:.3f}, C {conf_c:.3f}", "",
              "| 이미지 비중 w | 균형 정확도 | macro F1 | 영역 밖 재현율 | 앞 보기 오경보 |",

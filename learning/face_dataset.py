@@ -132,3 +132,16 @@ def false_alarms(split, pred):
         m = np.array([s == tag for s in split.subtags])
         out[tag] = (int(m.sum()), float(alarm[m].mean()) if m.any() else float("nan"))
     return out
+
+
+def zone_gate(probs, X, yaw_tol=5.0, pitch_tol=10.0):
+    """영역 연결: 고개 방향이 화면·강의 공간 범위 안이면 이미지 모델의 '영역 밖' 확률을 '앞 보기'로 옮긴다.
+    이미지는 고개를 돌렸는지는 보지만, 그 방향이 자리별 강의 공간인지는 알 수 없기 때문 (영역 캘리브레이션 정보).
+    범위 안 = 앞쪽 구간 밖 거리 ≤ yaw_tol°, 그리고 화면보다 pitch_tol° 넘게 위를 보지 않음 (pitch는 아래가 +)"""
+    col = {n: i for i, n in enumerate(NUM_INPUTS)}
+    inside = (X[:, col["out_front"]] <= yaw_tol) & (X[:, col["d_pitch"]] >= -pitch_tol)
+    out = probs.copy()
+    f, a = FACE_CLASSES.index("front"), FACE_CLASSES.index("away")
+    out[inside, f] += out[inside, a]
+    out[inside, a] = 0.0
+    return out

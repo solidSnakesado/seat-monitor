@@ -8,6 +8,8 @@
 E = (1 − w) × B + w × C (--img-weight w, B·C가 모두 있을 때).
 모든 방식을 얼굴 이미지가 있는 프레임(3프레임마다)으로 맞춰 평가한다.
 결과: 화면 출력 + results/compare_face_날짜_시간.md (results/**/compare_*.md는 git 제외)
+히스토리: 실행할 때마다 results/face_history.md에 한 줄을 추가한다 (숫자만 있어 git에 포함).
+  --note로 단계 이름을 적는다 (예: --note "메인 5세션", --note "C freeze 9")
 """
 import argparse
 from datetime import datetime
@@ -34,6 +36,7 @@ def parse_args():
     ap.add_argument("--test", action="store_true", help="검증 대신 테스트 세션(_test)으로 비교")
     ap.add_argument("--img-weight", type=float, default=0.5, help="E 결과 결합의 이미지 비중 w")
     ap.add_argument("--out", default=str(root / "results"))
+    ap.add_argument("--note", default="", help="히스토리에 남길 단계 이름 (예: 확인용 1세션)")
     args = ap.parse_args()
     if not args.test and not args.val_sessions:
         ap.error("--val-sessions 또는 --test 중 하나가 필요합니다")
@@ -82,10 +85,46 @@ def report(split, preds, title):
     return "\n".join(lines)
 
 
+HISTORY_HEAD = """# 얼굴 판정 성능 히스토리
+
+`python -m evaluation.face_compare`를 실행할 때마다 한 줄씩 추가된다 (지우지 않고 누적).
+A MediaPipe만 / B 수치만 학습 / C 이미지만 학습 / D 수치 + 이미지 학습 / E B·C 결과 결합.
+점수는 균형 정확도, 오경보는 앞 보기 구간(화면·강의 공간·헷갈리는 동작)을 영역 밖·졸음·하품으로 판정한 비율.
+
+| 날짜 | 단계 | 학습 세션 | 평가 세션 | A | B | C | D | E | 오경보 A / B / C / D / E | 상세 |
+|---|---|---|---|---|---|---|---|---|---|---|
+"""
+
+
+def short(sessions):
+    """세션 이름 → 태그만 (face_session_날짜_시간_ 제거)"""
+    names = dict.fromkeys(s.split("_", 4)[-1] if s.count("_") >= 4 else s for s in sessions)
+    return ", ".join(names) or "-"
+
+
+def append_history(path, note, train, split, title, preds, detail):
+    n = len(FACE_CLASSES)
+    front = np.array([t != "" and FACE_CLASSES[y] == "front" for t, y in zip(split.subtags, split.y)])
+    alarm_idx = [FACE_CLASSES.index(c) for c in ("away", "drowsy", "yawn")]
+    score, alarm = {}, {}
+    for k, pred in preds.items():
+        score[k[0]] = f"{balanced_acc(confusion(split.y, pred, n)):.3f}"
+        alarm[k[0]] = f"{np.isin(pred[front], alarm_idx).mean():.0%}" if front.any() else "-"
+    cols = [score.get(m, "-") for m in "ABCDE"]
+    row = (f"| {datetime.now():%Y-%m-%d %H:%M} | {note or '-'} | {short(train.sessions)} | "
+           f"{title}: {short(split.sessions)} | " + " | ".join(cols) + " | "
+           + " / ".join(alarm.get(m, "-") for m in "ABCDE") + f" | {detail} |\n")
+    path = Path(path)
+    if not path.exists():
+        path.write_text(HISTORY_HEAD, encoding="utf-8")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(row)
+
+
 def main():
     args = parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    _, val, test = load_face_splits(args.data, [] if args.test else args.val_sessions)
+    train, val, test = load_face_splits(args.data, [] if args.test else args.val_sessions)
     split = (test if args.test else val).with_images()
     if len(split) == 0:
         raise SystemExit("비교할 프레임이 없습니다 (세션 이름 또는 _test 세션 확인)")
@@ -99,7 +138,9 @@ def main():
     Path(args.out).mkdir(parents=True, exist_ok=True)
     out = Path(args.out) / f"compare_face_{datetime.now():%Y%m%d_%H%M%S}.md"
     out.write_text(text, encoding="utf-8")
-    print(f"\n저장: {out}")
+    hist = Path(args.out) / "face_history.md"
+    append_history(hist, args.note, train, split, "테스트" if args.test else "검증", preds, out.name)
+    print(f"\n저장: {out}\n히스토리 추가: {hist}")
 
 
 if __name__ == "__main__":

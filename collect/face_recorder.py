@@ -1,6 +1,8 @@
 """얼굴 세션 기록: 프레임마다 라벨 + 고개 각도 + blendshape 52개를 CSV로, N프레임마다 얼굴 crop 이미지를 저장
 
-CSV 열: t, label, intensity, subtag, glasses, yaw, pitch, roll, blendshape 52개(이름 그대로), image
+CSV 열: t, label, intensity, subtag, glasses, face, yaw, pitch, roll, blendshape 52개(이름 그대로), image
+  - face: 1 얼굴 검출, 0 미검출 (녹화 중 얼굴을 놓친 프레임도 남긴다. 값 열은 빈칸)
+    face 열이 없는 이전 세션은 모든 행이 검출 프레임 (불러올 때 1로 간주)
   - image: CSV 기준 상대 경로. 원본 해상도에서 얼굴을 잘라 128×128로 저장, 저장하지 않은 프레임은 빈칸
   - 파일 이름: face_session_날짜_시간[_태그]_g(0|1)[_test].csv
 영역 캘리브레이션 결과는 같은 이름의 .json에 저장한다.
@@ -17,6 +19,18 @@ import numpy as np
 from collect.face_guide import FACE_CLASSES, FACE_KO, SUBTAG_KO
 from common.face_features import head_angles
 
+# Face Landmarker blendshape 52개 (모델 출력 순서). 얼굴이 없는 프레임도 같은 열로 쓰기 위해 고정
+BLENDSHAPES = (
+    "_neutral", "browDownLeft", "browDownRight", "browInnerUp", "browOuterUpLeft", "browOuterUpRight",
+    "cheekPuff", "cheekSquintLeft", "cheekSquintRight", "eyeBlinkLeft", "eyeBlinkRight",
+    "eyeLookDownLeft", "eyeLookDownRight", "eyeLookInLeft", "eyeLookInRight", "eyeLookOutLeft",
+    "eyeLookOutRight", "eyeLookUpLeft", "eyeLookUpRight", "eyeSquintLeft", "eyeSquintRight",
+    "eyeWideLeft", "eyeWideRight", "jawForward", "jawLeft", "jawOpen", "jawRight", "mouthClose",
+    "mouthDimpleLeft", "mouthDimpleRight", "mouthFrownLeft", "mouthFrownRight", "mouthFunnel",
+    "mouthLeft", "mouthLowerDownLeft", "mouthLowerDownRight", "mouthPressLeft", "mouthPressRight",
+    "mouthPucker", "mouthRight", "mouthRollLower", "mouthRollUpper", "mouthShrugLower",
+    "mouthShrugUpper", "mouthSmileLeft", "mouthSmileRight", "mouthStretchLeft", "mouthStretchRight",
+    "mouthUpperUpLeft", "mouthUpperUpRight", "noseSneerLeft", "noseSneerRight")
 FACE_SIZE = 128     # 저장 이미지 한 변 (픽셀)
 MARGIN = 1.4        # 얼굴 랜드마크 상자 대비 crop 크기 배율
 
@@ -56,7 +70,7 @@ class FaceRecorder:
         self.zone_path = self.path.with_suffix(".json")
         self.img_dir = Path("images") / name
         self.img_every, self.glasses = img_every, glasses
-        self.counts = {c: 0 for c in FACE_CLASSES}
+        self.counts = {c: (0, 0) for c in FACE_CLASSES}   # 라벨 → (프레임, 얼굴 미검출)
         self.sub_counts = {}
         self.n_images = 0
         self._file = self._writer = None
@@ -68,24 +82,30 @@ class FaceRecorder:
         return self.path.stem.endswith("_test")
 
     def write(self, t, step, result, clean_frame):
-        """result: FaceDetector.detect 결과 (얼굴이 있는 프레임만 기록)"""
-        blend = result.face_blendshapes[0]
-        matrix = result.facial_transformation_matrixes[0]
+        """result: FaceDetector.detect 결과, 얼굴이 없으면 None (값 열은 빈칸, face=0)"""
         if self._writer is None:
             self._file = open(self.path, "w", newline="")
             self._writer = csv.writer(self._file)
-            self._writer.writerow(["t", "label", "intensity", "subtag", "glasses", "yaw", "pitch", "roll",
-                                   *[c.category_name for c in blend], "image"])
-        yaw, pitch = head_angles(matrix)
-        image = ""
-        if self.img_every > 0 and self._row % self.img_every == 0:
-            image = self._save_image(clean_frame, result.face_landmarks[0])
+            self._writer.writerow(["t", "label", "intensity", "subtag", "glasses", "face",
+                                   "yaw", "pitch", "roll", *BLENDSHAPES, "image"])
+        found = result is not None and bool(result.face_blendshapes) and bool(result.facial_transformation_matrixes)
+        if found:
+            matrix = result.facial_transformation_matrixes[0]
+            yaw, pitch = head_angles(matrix)
+            scores = {c.category_name: c.score for c in result.face_blendshapes[0]}
+            values = [f"{yaw:.2f}", f"{pitch:.2f}", f"{head_roll(matrix):.2f}",
+                      *[f"{scores[n]:.4f}" if n in scores else "" for n in BLENDSHAPES]]
+            image = ""
+            if self.img_every > 0 and self._row % self.img_every == 0:
+                image = self._save_image(clean_frame, result.face_landmarks[0])
+        else:
+            values, image = [""] * (3 + len(BLENDSHAPES)), ""
         self._writer.writerow([f"{t:.3f}", step.label, step.intensity, step.subtag, self.glasses,
-                               f"{yaw:.2f}", f"{pitch:.2f}", f"{head_roll(matrix):.2f}",
-                               *[f"{c.score:.4f}" for c in blend], image])
-        self.counts[step.label] += 1
-        if step.subtag:
-            self.sub_counts[step.subtag] = self.sub_counts.get(step.subtag, 0) + 1
+                               int(found), *values, image])
+        for key, d in ((step.label, self.counts), (step.subtag, self.sub_counts)):
+            if key:
+                n, miss = d.get(key, (0, 0))
+                d[key] = (n + 1, miss + (not found))
         self._row += 1
 
     def _save_image(self, frame, landmarks):
@@ -107,9 +127,9 @@ class FaceRecorder:
         if self._file:
             self._file.close()
             print(f"저장: {self.path}  (이미지 {self.n_images}장)")
-            for c, n in self.counts.items():
-                print(f"  {FACE_KO[c]:<6} {n:6d} 프레임")
-            for s, n in self.sub_counts.items():
-                print(f"    └ {SUBTAG_KO[s]:<10} {n:6d} 프레임")
+            for c, (n, miss) in self.counts.items():
+                print(f"  {FACE_KO[c]:<6} {n:6d} 프레임  (얼굴 미검출 {miss / max(n, 1):5.1%})")
+            for s, (n, miss) in self.sub_counts.items():
+                print(f"    └ {SUBTAG_KO[s]:<10} {n:6d} 프레임  (얼굴 미검출 {miss / max(n, 1):5.1%})")
         if self.zone_path.exists():
             print(f"영역: {self.zone_path}")

@@ -6,7 +6,8 @@
   python -m collect.face_collect --test --glasses 1                        # 테스트 세션 (학습에 사용 안 함)
 
 시작하면 영역 캘리브레이션(화면 → 경계 A → 경계 B → 책상)이 자동으로 진행된다.
-키: Space 안내 시작 / 일시정지·계속, n 다음 단계, s 안내 중단, z 영역 다시 측정, ESC 종료
+한 단계가 끝나면 대기하고 Space를 눌러야 다음 단계로 간다.
+키: Space 안내 시작 / 다음 단계 시작 / 일시정지·계속, n 단계 건너뛰기, s 안내 중단, z 영역 다시 측정, ESC 종료
 """
 import argparse
 import time
@@ -21,7 +22,7 @@ from common.face_features import FaceDetector, compute_face_features, draw_face_
 from common.korean_text import TextRenderer
 
 GREEN, RED, YELLOW, WHITE = (0, 255, 0), (0, 0, 255), (0, 255, 255), (255, 255, 255)
-HELP = "Space 안내 시작·일시정지 | n 다음 | s 안내 중단 | z 영역 다시 | ESC 종료"
+HELP = "Space 시작·다음·일시정지 | n 건너뛰기 | s 안내 중단 | z 영역 다시 | ESC 종료"
 
 
 def parse_args():
@@ -51,18 +52,18 @@ def value_line(f, zones):
 
 
 def status_lines(rec, guide, calib):
-    total = sum(rec.counts.values())
+    total = sum(n for n, _ in rec.counts.values())
     kind = "테스트" if rec.is_test else "학습"
     glasses = "안경 착용" if rec.glasses else "안경 미착용"
     on = guide.recording
     lines = [(f"{'● 녹화 중' if on else '■ 정지'}  [{kind} · {glasses}]  누적 {total} 프레임  "
               f"이미지 {rec.n_images}장", RED if on else WHITE)]
-    if guide.running or guide.state == "done":
+    if guide.running or guide.waiting or guide.state == "done":
         lines += guide.lines()
     else:
         lines.append((f"Space: 안내 시작 (약 {guide.total_seconds() / 60:.0f}분)", GREEN))
     lines += calib.summary_lines()
-    lines.append(("  ".join(f"{FACE_KO[c]} {n}" for c, n in rec.counts.items()), WHITE))
+    lines.append(("  ".join(f"{FACE_KO[c]} {n}" for c, (n, _) in rec.counts.items()), WHITE))
     return lines
 
 
@@ -71,11 +72,13 @@ def handle_key(key, guide, calib, now):
     if key == 27:
         return False
     if key == ord(" ") and calib.ready:
-        if guide.running:
+        if guide.waiting:                       # 단계 완료 후 대기 → 다음 단계 시작
+            guide.advance()
+        elif guide.running:
             guide.toggle_pause()
         else:
             guide.start()
-    elif key == ord("n") and guide.running:
+    elif key == ord("n") and (guide.running or guide.waiting):
         guide.skip()
     elif key == ord("s"):
         guide.stop()
@@ -113,7 +116,7 @@ def main():
             res = detector.detect(frame)
             f = compute_face_features(res)
             draw_face_points(frame, res)
-            guide.update(dt, active=f is not None and not calib.active)
+            guide.update(dt, active=not calib.active)  # 얼굴을 놓쳐도 안내 시간은 계속
 
             if calib.active:
                 if calib.add(f, now):
@@ -122,8 +125,10 @@ def main():
                 if f is None:
                     lines.append(("얼굴이 보이지 않습니다", RED))
             elif f is None:
+                if guide.recording:                  # 얼굴 없음으로 기록 (뒤돌아보기, 컵으로 가림 등)
+                    rec.write(now - t0, guide.step, None, clean)
                 lines = status_lines(rec, guide, calib)
-                lines.append(("얼굴이 보이지 않습니다 (기록·안내 시간 멈춤)", RED))
+                lines.append(("얼굴 미검출 (시간 계속, 얼굴 없음으로 기록)", RED))
             else:
                 if guide.recording:
                     rec.write(now - t0, guide.step, res, clean)

@@ -4,7 +4,8 @@
   1 front 화면 보기 60초 → 2 front 강의 공간 보기 60초 (--no-lecture면 생략) → 3 desk 60초
   → 4 away · 5 drowsy · 6 yawn 을 회차마다 섞은 순서로, 강도별 30초
   → 7 헷갈리는 동작 (front + 하위 태그) 각 30초 (안경 미착용이면 안경 고쳐 쓰기 생략)
-단계마다 3초 준비(녹화 안 함) 후 자동 녹화. 상태 진행은 collect_guide.Guide를 그대로 쓴다.
+단계마다 3초 준비(녹화 안 함) 후 자동 녹화. 한 단계가 끝나면 대기하고, Space를 눌러야 다음 단계로 간다
+(화면을 보지 않는 동작이 많아 자동으로 넘어가면 다음 단계를 놓치기 때문). 준비·녹화 진행은 collect_guide.Guide를 쓴다.
 """
 import random
 from dataclasses import dataclass
@@ -78,7 +79,30 @@ def build_face_steps(base_sec=60, step_sec=30, lecture=True, glasses=True, shuff
 
 
 class FaceGuide(Guide):
-    """collect_guide.Guide의 상태 진행을 그대로 쓰고 화면 문구만 얼굴용으로 바꾼다"""
+    """collect_guide.Guide의 준비·녹화 진행을 쓰되, 단계가 끝나면 wait 상태로 멈추고 화면 문구를 얼굴용으로 바꾼다"""
+
+    @property
+    def waiting(self):
+        return self.state == "wait"
+
+    def _next(self):
+        """녹화 시간이 끝났거나 n으로 건너뜀 → 마지막 단계면 done, 아니면 대기"""
+        self.elapsed = 0.0
+        self.state = "done" if self.idx + 1 >= len(self.steps) else "wait"
+
+    def advance(self):
+        """대기 중 Space: 다음 단계의 준비부터 시작"""
+        if self.waiting:
+            self.idx += 1
+            self.state, self.elapsed, self.paused = "prepare", 0.0, False
+
+    def skip(self):
+        """준비·녹화 중이면 지금 단계를, 대기 중이면 다음 단계를 건너뛰고 대기"""
+        if self.waiting:
+            self.idx += 1
+            self.state = "done" if self.idx + 1 >= len(self.steps) else "wait"
+        else:
+            self._next()
 
     def side_text(self):
         if not self.step.sided:
@@ -86,18 +110,30 @@ class FaceGuide(Guide):
         half = self.state == "record" and self.elapsed >= self.step.seconds / 2
         return "  → 다른 방향으로" if half else "  (먼저 한 방향)"
 
-    def lines(self, ko_labels=FACE_KO):
-        """화면 안내 줄 [(문자열, BGR 색)]"""
-        if self.state == "done":
-            return [("안내 완료! ESC로 종료하면 저장 결과가 출력됩니다", GREEN)]
-        if not self.running:
-            return []
-        s = self.step
-        title = f"[안내 {self.idx + 1}/{len(self.steps)}] {ko_labels[s.label]}"
+    def _title(self, i, ko_labels):
+        s = self.steps[i]
+        title = f"{ko_labels[s.label]}"
         if s.intensity != "none":
             title += f" · {INTENSITY_KO[s.intensity]}"
         if s.subtag:
             title += f" · {SUBTAG_KO[s.subtag]}"
+        return title
+
+    def lines(self, ko_labels=FACE_KO):
+        """화면 안내 줄 [(문자열, BGR 색)]"""
+        if self.state == "done":
+            return [("안내 완료! ESC로 종료하면 저장 결과가 출력됩니다", GREEN)]
+        n = len(self.steps)
+        if self.waiting:
+            nxt = self.steps[self.idx + 1]
+            return [(f"단계 완료 ({self.idx + 1}/{n})  다음: [{self.idx + 2}/{n}] "
+                     f"{self._title(self.idx + 1, ko_labels)}", CYAN),
+                    (nxt.text, WHITE),
+                    ("화면을 보고 Space로 시작 (n: 이 단계 건너뛰기)", YELLOW)]
+        if not self.running:
+            return []
+        s = self.step
+        title = f"[안내 {self.idx + 1}/{n}] {self._title(self.idx, ko_labels)}"
         if self.paused:
             status = ("일시정지 (Space로 계속)", YELLOW)
         elif self.state == "prepare":

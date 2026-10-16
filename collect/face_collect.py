@@ -5,7 +5,7 @@
   python -m collect.face_collect --tag home_day --glasses 0 --no-lecture   # 강의 공간 없음 (경계 A·B, 2단계 생략)
   python -m collect.face_collect --test --glasses 1                        # 테스트 세션 (학습에 사용 안 함)
 
-시작하면 영역 캘리브레이션(화면 → 경계 A → 경계 B → 책상)이 자동으로 진행된다.
+시작하면 영역 캘리브레이션(화면 → 경계 A → 경계 B → 책상)을 영역마다 Space를 눌러 진행한다.
 한 단계가 끝나면 대기하고 Space를 눌러야 다음 단계로 간다.
 키: Space 안내 시작 / 다음 단계 시작 / 일시정지·계속, n 단계 건너뛰기, s 안내 중단, z 영역 다시 측정, ESC 종료
 """
@@ -71,7 +71,9 @@ def handle_key(key, guide, calib, now):
     """→ False면 종료"""
     if key == 27:
         return False
-    if key == ord(" ") and calib.ready:
+    if key == ord(" ") and calib.active:          # 영역 캘리브레이션 대기 → 측정 시작
+        calib.go(now)
+    elif key == ord(" ") and calib.ready:
         if guide.waiting:                       # 단계 완료 후 대기 → 다음 단계 시작
             guide.advance()
         elif guide.running:

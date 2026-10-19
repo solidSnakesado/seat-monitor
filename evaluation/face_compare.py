@@ -1,4 +1,4 @@
-"""얼굴 판정 방식 비교 (같은 프레임, 같은 지표): A MediaPipe만 / B 수치 / C 이미지 / D 수치+이미지 / E 결과 결합
+"""얼굴 판정 방식 비교 (같은 프레임, 같은 지표): A MediaPipe만 / B 수치 / C 이미지 / D 수치+이미지 / E 결과 결합 / T 시계열 / F
 
 프로젝트 루트(~/dev_ws/mediaPipe)에서 실행:
   python -m evaluation.face_compare --val-sessions g0 --dir models/face/check     # 검증 세션으로 비교
@@ -9,10 +9,11 @@
   python -m evaluation.face_compare --val-sessions val --dir models/face/v1 \
       --cnn models/face/v1/cnn_ls_erase.pt models/face/v1/cnn_ls_erase_s1.pt --img-weight 0.4 --note "C 스무딩+가리기 2개"
 E = (1 − w) × B + w × C (--img-weight w, B·C가 모두 있을 때).
---zone-gate: E에 영역 연결 적용 (learning.face_dataset.zone_gate). 히스토리의 E 열에 그대로 기록되므로 --note에 적는다.
+--seq: T 시계열 모델 (learning.face_seq_train). F = (1 − w) × T + w × C (E에서 B 대신 T).
+--zone-gate: E·F에 영역 연결 적용 (learning.face_dataset.zone_gate). 히스토리의 E 열에 그대로 기록되므로 --note에 적는다.
 모든 방식을 얼굴 이미지가 있는 프레임(3프레임마다)으로 맞춰 평가한다.
 결과: 화면 출력 + results/compare_face_날짜_시간.md (results/**/compare_*.md는 git 제외)
-히스토리: 실행할 때마다 results/face_history.md에 한 줄을 추가한다 (숫자만 있어 git에 포함).
+히스토리: 실행할 때마다 results/face_history.md에 한 줄을 추가한다 (evaluation.face_history, git에 포함).
   --note로 단계 이름을 적는다 (예: --note "메인 5세션", --note "C freeze 9")
 """
 import argparse
@@ -24,8 +25,10 @@ import torch
 
 from collect.face_guide import FACE_CLASSES, FACE_KO, SUBTAG_KO
 from evaluation.eval_metrics import balanced_acc, confusion, format_cm, macro_f1, recalls
+from evaluation.face_history import append_history
 from learning.face_dataset import false_alarms, load_face_splits, rule_predict, zone_gate
 from learning.face_image_train import face_loader, load_face_image_model
+from learning.face_seq_train import load_seq_model, seq_probs
 from learning.face_train import load_face_mlp
 from learning.image_model import image_probs
 from learning.posture_model import mlp_probs
@@ -40,6 +43,7 @@ def parse_args():
     ap.add_argument("--test", action="store_true", help="검증 대신 테스트 세션(_test)으로 비교")
     ap.add_argument("--cnn", nargs="+", default=None, help="C 이미지 모델 파일 (여러 개면 평균, 기본: --dir/cnn.pt)")
     ap.add_argument("--fusion", nargs="+", default=None, help="D 융합 모델 파일 (여러 개면 평균, 기본: --dir/fusion.pt)")
+    ap.add_argument("--seq", default="", help="T 시계열 모델 파일 (learning.face_seq_train)")
     ap.add_argument("--zone-gate", action="store_true",
                     help="E에서 고개가 화면·강의 공간 범위 안이면 이미지의 '영역 밖' 확률을 '앞 보기'로 옮김")
     ap.add_argument("--img-weight", type=float, default=0.5, help="E 결과 결합의 이미지 비중 w")
@@ -71,7 +75,7 @@ def model_paths(given, model_dir, fname):
     return [str(p)] if p.exists() else []
 
 
-def predict_all(split, model_dir, w, device, cnn=None, fusion=None, gate=False):
+def predict_all(split, model_dir, w, device, cnn=None, fusion=None, gate=False, seq=None):
     """→ ({방식 이름: 예측 (N,)}, 사용한 모델 설명)"""
     out = {"A MediaPipe만 (규칙)": rule_predict(split.X)}
     probs, used = {}, []
@@ -88,9 +92,15 @@ def predict_all(split, model_dir, w, device, cnn=None, fusion=None, gate=False):
             used.append(f"{key} = {', '.join(Path(x).name for x in paths)}")
     b = probs.get("B 수치 MLP")
     c = next((v for k, v in probs.items() if k.startswith("C ")), None)
-    if b is not None and c is not None:
-        name = f"E 결과 결합 (이미지 {w:.1f}" + (", 영역 연결)" if gate else ")")
-        probs[name] = (1 - w) * b + w * (zone_gate(c, split.X) if gate else c)
+    cg = (zone_gate(c, split.X) if gate else c) if c is not None else None
+    tail = ", 영역 연결)" if gate else ")"
+    if b is not None and cg is not None:
+        probs[f"E 결과 결합 (이미지 {w:.1f}{tail}"] = (1 - w) * b + w * cg
+    if seq is not None:
+        probs["T 시계열"] = seq[0]
+        used.append(f"T = {seq[1]}")
+        if cg is not None:
+            probs[f"F T·C 결합 (이미지 {w:.1f}{tail}"] = (1 - w) * seq[0] + w * cg
     out.update({k: v.argmax(1) for k, v in probs.items()})
     return out, "; ".join(used)
 
@@ -119,54 +129,24 @@ def report(split, preds, title, used=""):
     return "\n".join(lines)
 
 
-HISTORY_HEAD = """# 얼굴 판정 성능 히스토리
-
-`python -m evaluation.face_compare`를 실행할 때마다 한 줄씩 추가된다 (지우지 않고 누적).
-A MediaPipe만 / B 수치만 학습 / C 이미지만 학습 / D 수치 + 이미지 학습 / E B·C 결과 결합.
-점수는 균형 정확도, 오경보는 앞 보기 구간(화면·강의 공간·헷갈리는 동작)을 영역 밖·졸음·하품으로 판정한 비율.
-
-| 날짜 | 단계 | 학습 세션 | 평가 세션 | A | B | C | D | E | 오경보 A / B / C / D / E | 상세 |
-|---|---|---|---|---|---|---|---|---|---|---|
-"""
-
-
-def short(sessions):
-    """세션 이름 → 태그만 (face_session_날짜_시간_ 제거)"""
-    names = dict.fromkeys(s.split("_", 4)[-1] if s.count("_") >= 4 else s for s in sessions)
-    return ", ".join(names) or "-"
-
-
-def append_history(path, note, train, split, title, preds, detail):
-    n = len(FACE_CLASSES)
-    front = np.array([t != "" and FACE_CLASSES[y] == "front" for t, y in zip(split.subtags, split.y)])
-    alarm_idx = [FACE_CLASSES.index(c) for c in ("away", "drowsy", "yawn")]
-    score, alarm = {}, {}
-    for k, pred in preds.items():
-        score[k[0]] = f"{balanced_acc(confusion(split.y, pred, n)):.3f}"
-        alarm[k[0]] = f"{np.isin(pred[front], alarm_idx).mean():.0%}" if front.any() else "-"
-    cols = [score.get(m, "-") for m in "ABCDE"]
-    row = (f"| {datetime.now():%Y-%m-%d %H:%M} | {note or '-'} | {short(train.sessions)} | "
-           f"{title}: {short(split.sessions)} | " + " | ".join(cols) + " | "
-           + " / ".join(alarm.get(m, "-") for m in "ABCDE") + f" | {detail} |\n")
-    path = Path(path)
-    if not path.exists():
-        path.write_text(HISTORY_HEAD, encoding="utf-8")
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(row)
-
-
 def main():
     args = parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     train, val, test = load_face_splits(args.data, [] if args.test else args.val_sessions)
-    split = (test if args.test else val).with_images()
+    full = test if args.test else val
+    keep = [i for i, p in enumerate(full.images) if p]
+    split = full.subset(keep)
+    seq = None
+    if args.seq:                                       # T는 이미지가 없는 프레임까지 이어서 봐야 하므로 전체에서 계산
+        model, mean, std, win = load_seq_model(args.seq, device)
+        seq = (seq_probs(model, full, mean, std, win, device)[keep], Path(args.seq).name)
     if len(split) == 0:
         raise SystemExit("비교할 프레임이 없습니다 (세션 이름 또는 _test 세션 확인)")
     missing = split.missing_images()
     if missing:
         raise SystemExit(f"얼굴 이미지 {len(missing)}장이 없습니다 (예: {missing[0]})")
     title = "테스트" if args.test else f"검증 ({' '.join(args.val_sessions)})"
-    preds, used = predict_all(split, args.dir, args.img_weight, device, args.cnn, args.fusion, args.zone_gate)
+    preds, used = predict_all(split, args.dir, args.img_weight, device, args.cnn, args.fusion, args.zone_gate, seq)
     text = report(split, preds, title, used)
     print(text)
     Path(args.out).mkdir(parents=True, exist_ok=True)

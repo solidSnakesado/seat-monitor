@@ -12,6 +12,7 @@ E = (1 − w) × B + w × C (--img-weight w, B·C가 모두 있을 때).
 --seq: T 시계열 모델 (learning.face_seq_train), 여러 개면 확률 평균 (seed 앙상블). F = (1 − w) × T + w × C (E에서 B 대신 T).
 --zone-gate: E·F에 영역 연결 적용 (learning.face_dataset.zone_gate). 히스토리의 E 열에 그대로 기록되므로 --note에 적는다.
 --gate-yaw: 영역 연결 허용 범위 (기본 5°). 앞쪽 구간 밖으로 이 값까지는 '앞 보기'로 본다.
+--events: 지속 시간 필터를 적용한 이벤트 단위 지표 표를 보고서에 추가 (evaluation.face_events).
 모든 방식을 얼굴 이미지가 있는 프레임(3프레임마다)으로 맞춰 평가한다.
 결과: 화면 출력 + results/compare_face_날짜_시간.md (results/**/compare_*.md는 git 제외)
 히스토리: 실행할 때마다 results/face_history.md에 한 줄을 추가한다 (evaluation.face_history, git에 포함).
@@ -26,6 +27,7 @@ import torch
 
 from collect.face_guide import FACE_CLASSES, FACE_KO, SUBTAG_KO
 from evaluation.eval_metrics import balanced_acc, confusion, format_cm, macro_f1, recalls
+from evaluation.face_events import events_report
 from evaluation.face_history import append_history
 from learning.face_dataset import false_alarms, load_face_splits, rule_predict, zone_gate
 from learning.face_image_train import face_loader, load_face_image_model
@@ -49,6 +51,7 @@ def parse_args():
                     help="E에서 고개가 화면·강의 공간 범위 안이면 이미지의 '영역 밖' 확률을 '앞 보기'로 옮김")
     ap.add_argument("--gate-yaw", type=float, default=5.0,
                     help="영역 연결 허용 범위: 앞쪽 구간 밖 거리가 이 값(°) 이하면 '앞 보기'로 본다")
+    ap.add_argument("--events", action="store_true", help="이벤트 단위 지표(지속 시간 필터 적용) 추가")
     ap.add_argument("--img-weight", type=float, default=0.5, help="E 결과 결합의 이미지 비중 w")
     ap.add_argument("--out", default=str(root / "results"))
     ap.add_argument("--note", default="", help="히스토리에 남길 단계 이름 (예: 확인용 1세션)")
@@ -163,6 +166,8 @@ def main():
     preds, used = predict_all(split, args.dir, args.img_weight, device, args.cnn, args.fusion, args.zone_gate, seq,
                               args.gate_yaw)
     text = report(split, preds, title, used)
+    if args.events:
+        text += "\n" + events_report(split, preds) + "\n"
     print(text)
     Path(args.out).mkdir(parents=True, exist_ok=True)
     out = Path(args.out) / f"compare_face_{datetime.now():%Y%m%d_%H%M%S}.md"

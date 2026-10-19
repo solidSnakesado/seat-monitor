@@ -4,6 +4,7 @@
   - 파일 이름에 '_test'가 있는 세션 → 테스트 (학습·모델 선택에 사용 안 함)
   - val_sessions에 이름 일부가 맞는 세션 → 통째로 검증, 나머지 → 학습
   - face=0(얼굴 미검출) 행은 제외. face 열이 없는 이전 세션은 모두 검출 프레임으로 본다
+  - t = 세션 시작부터의 초 (이벤트 단위 지표에서 지속 시간 필터에 사용, evaluation.face_events)
 특징 (방식 B, D의 수치 입력):
   blendshape 51개(_neutral 제외), 화면 대비 yaw·pitch, roll,
   앞쪽 구간 밖 거리(yaw가 화면·경계 A·B를 포함한 범위 밖으로 벗어난 각도), 책상 대비 pitch
@@ -34,6 +35,7 @@ class FaceSplit:
     sessions: list       # 세션 이름
     subtags: list        # 하위 태그 (screen, lecture, talk, ...), 없으면 ""
     images: list         # 얼굴 crop 이미지 절대 경로, 없으면 ""
+    t: np.ndarray = None # (N,) 세션 안 시각 (초)
 
     def __len__(self):
         return len(self.y)
@@ -41,7 +43,8 @@ class FaceSplit:
     def subset(self, idx):
         idx = np.asarray(idx, dtype=int)
         return FaceSplit(self.X[idx], self.y[idx], [self.sessions[i] for i in idx],
-                         [self.subtags[i] for i in idx], [self.images[i] for i in idx])
+                         [self.subtags[i] for i in idx], [self.images[i] for i in idx],
+                         None if self.t is None else self.t[idx])
 
     def with_images(self):
         return self.subset([i for i, p in enumerate(self.images) if p])
@@ -60,7 +63,7 @@ def _session_rows(csv_path):
     zones = json.loads(csv_path.with_suffix(".json").read_text(encoding="utf-8"))["zones"]
     scr, desk = zones["screen"], zones.get("desk", zones["screen"])
     lo, hi = _front_range(zones)
-    X, y, subtags, images = [], [], [], []
+    X, y, subtags, images, t = [], [], [], [], []
     with open(csv_path, newline="") as f:
         for r in csv.DictReader(f):
             if r.get("face", "1") == "0" or not r["yaw"]:
@@ -72,7 +75,8 @@ def _session_rows(csv_path):
             y.append(FACE_CLASSES.index(r["label"]))
             subtags.append(r["subtag"])
             images.append(str((csv_path.parent / r["image"]).resolve()) if r["image"] else "")
-    return X, y, subtags, images
+            t.append(float(r["t"]))
+    return X, y, subtags, images, t
 
 
 def load_face_splits(data_dir, val_sessions):
@@ -87,8 +91,8 @@ def load_face_splits(data_dir, val_sessions):
             continue
         kind = ("test" if p.stem.endswith("_test")
                 else "val" if any(v in p.stem for v in (val_sessions or [])) else "train")
-        X, y, subtags, images = _session_rows(p)
-        parts[kind].append((p.stem, X, y, subtags, images))
+        X, y, subtags, images, t = _session_rows(p)
+        parts[kind].append((p.stem, X, y, subtags, images, t))
         print(f"  [{kind:<5}] {p.stem}  {len(y)} 프레임")
     return tuple(_merge(parts[k]) for k in ("train", "val", "test"))
 
@@ -98,9 +102,10 @@ def _merge(items):
     X = np.array([x for _, xs, *_ in items for x in xs], dtype=np.float32).reshape(-1, n_in)
     y = np.array([v for _, _, ys, *_ in items for v in ys], dtype=np.int64)
     sessions = [name for name, _, ys, *_ in items for _ in ys]
-    subtags = [s for *_, ss, _ in items for s in ss]
-    images = [i for *_, ims in items for i in ims]
-    return FaceSplit(X, y, sessions, subtags, images)
+    subtags = [s for *_, ss, _, _ in items for s in ss]
+    images = [i for *_, ims, _ in items for i in ims]
+    t = np.array([v for *_, ts in items for v in ts], dtype=np.float64)
+    return FaceSplit(X, y, sessions, subtags, images, t)
 
 
 def rule_predict(X, th=None):

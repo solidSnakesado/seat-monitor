@@ -9,8 +9,9 @@
   python -m evaluation.face_compare --val-sessions val --dir models/face/v1 \
       --cnn models/face/v1/cnn_ls_erase.pt models/face/v1/cnn_ls_erase_s1.pt --img-weight 0.4 --note "C 스무딩+가리기 2개"
 E = (1 − w) × B + w × C (--img-weight w, B·C가 모두 있을 때).
---seq: T 시계열 모델 (learning.face_seq_train). F = (1 − w) × T + w × C (E에서 B 대신 T).
+--seq: T 시계열 모델 (learning.face_seq_train), 여러 개면 확률 평균 (seed 앙상블). F = (1 − w) × T + w × C (E에서 B 대신 T).
 --zone-gate: E·F에 영역 연결 적용 (learning.face_dataset.zone_gate). 히스토리의 E 열에 그대로 기록되므로 --note에 적는다.
+--gate-yaw: 영역 연결 허용 범위 (기본 5°). 앞쪽 구간 밖으로 이 값까지는 '앞 보기'로 본다.
 모든 방식을 얼굴 이미지가 있는 프레임(3프레임마다)으로 맞춰 평가한다.
 결과: 화면 출력 + results/compare_face_날짜_시간.md (results/**/compare_*.md는 git 제외)
 히스토리: 실행할 때마다 results/face_history.md에 한 줄을 추가한다 (evaluation.face_history, git에 포함).
@@ -43,9 +44,11 @@ def parse_args():
     ap.add_argument("--test", action="store_true", help="검증 대신 테스트 세션(_test)으로 비교")
     ap.add_argument("--cnn", nargs="+", default=None, help="C 이미지 모델 파일 (여러 개면 평균, 기본: --dir/cnn.pt)")
     ap.add_argument("--fusion", nargs="+", default=None, help="D 융합 모델 파일 (여러 개면 평균, 기본: --dir/fusion.pt)")
-    ap.add_argument("--seq", default="", help="T 시계열 모델 파일 (learning.face_seq_train)")
+    ap.add_argument("--seq", nargs="+", default=None, help="T 시계열 모델 파일 (여러 개면 평균, learning.face_seq_train)")
     ap.add_argument("--zone-gate", action="store_true",
                     help="E에서 고개가 화면·강의 공간 범위 안이면 이미지의 '영역 밖' 확률을 '앞 보기'로 옮김")
+    ap.add_argument("--gate-yaw", type=float, default=5.0,
+                    help="영역 연결 허용 범위: 앞쪽 구간 밖 거리가 이 값(°) 이하면 '앞 보기'로 본다")
     ap.add_argument("--img-weight", type=float, default=0.5, help="E 결과 결합의 이미지 비중 w")
     ap.add_argument("--out", default=str(root / "results"))
     ap.add_argument("--note", default="", help="히스토리에 남길 단계 이름 (예: 확인용 1세션)")
@@ -64,6 +67,15 @@ def image_model_probs(split, paths, device):
     return np.mean(out, axis=0)
 
 
+def seq_ensemble_probs(split, paths, device):
+    """T 시계열 모델 여러 개의 확률 평균 (seed 앙상블, 프레임 순서 유지)"""
+    out = []
+    for p in paths:
+        model, mean, std, win = load_seq_model(p, device)
+        out.append(seq_probs(model, split, mean, std, win, device))
+    return np.mean(out, axis=0)
+
+
 def model_paths(given, model_dir, fname):
     """직접 지정한 파일들, 없으면 --dir의 기본 파일 (있을 때만)"""
     if given:
@@ -75,7 +87,7 @@ def model_paths(given, model_dir, fname):
     return [str(p)] if p.exists() else []
 
 
-def predict_all(split, model_dir, w, device, cnn=None, fusion=None, gate=False, seq=None):
+def predict_all(split, model_dir, w, device, cnn=None, fusion=None, gate=False, seq=None, gate_yaw=5.0):
     """→ ({방식 이름: 예측 (N,)}, 사용한 모델 설명)"""
     out = {"A MediaPipe만 (규칙)": rule_predict(split.X)}
     probs, used = {}, []
@@ -92,12 +104,14 @@ def predict_all(split, model_dir, w, device, cnn=None, fusion=None, gate=False, 
             used.append(f"{key} = {', '.join(Path(x).name for x in paths)}")
     b = probs.get("B 수치 MLP")
     c = next((v for k, v in probs.items() if k.startswith("C ")), None)
-    cg = (zone_gate(c, split.X) if gate else c) if c is not None else None
-    tail = ", 영역 연결)" if gate else ")"
+    cg = (zone_gate(c, split.X, yaw_tol=gate_yaw) if gate else c) if c is not None else None
+    tail = f", 영역 연결 {gate_yaw:g}°)" if gate else ")"
+    if gate:
+        used.append(f"영역 연결 허용 {gate_yaw:g}°")
     if b is not None and cg is not None:
         probs[f"E 결과 결합 (이미지 {w:.1f}{tail}"] = (1 - w) * b + w * cg
     if seq is not None:
-        probs["T 시계열"] = seq[0]
+        probs["T 시계열" + (f" ×{seq[2]}" if seq[2] > 1 else "")] = seq[0]
         used.append(f"T = {seq[1]}")
         if cg is not None:
             probs[f"F T·C 결합 (이미지 {w:.1f}{tail}"] = (1 - w) * seq[0] + w * cg
@@ -138,15 +152,16 @@ def main():
     split = full.subset(keep)
     seq = None
     if args.seq:                                       # T는 이미지가 없는 프레임까지 이어서 봐야 하므로 전체에서 계산
-        model, mean, std, win = load_seq_model(args.seq, device)
-        seq = (seq_probs(model, full, mean, std, win, device)[keep], Path(args.seq).name)
+        seq = (seq_ensemble_probs(full, model_paths(args.seq, args.dir, ""), device)[keep],
+               ", ".join(Path(p).name for p in args.seq), len(args.seq))
     if len(split) == 0:
         raise SystemExit("비교할 프레임이 없습니다 (세션 이름 또는 _test 세션 확인)")
     missing = split.missing_images()
     if missing:
         raise SystemExit(f"얼굴 이미지 {len(missing)}장이 없습니다 (예: {missing[0]})")
     title = "테스트" if args.test else f"검증 ({' '.join(args.val_sessions)})"
-    preds, used = predict_all(split, args.dir, args.img_weight, device, args.cnn, args.fusion, args.zone_gate, seq)
+    preds, used = predict_all(split, args.dir, args.img_weight, device, args.cnn, args.fusion, args.zone_gate, seq,
+                              args.gate_yaw)
     text = report(split, preds, title, used)
     print(text)
     Path(args.out).mkdir(parents=True, exist_ok=True)

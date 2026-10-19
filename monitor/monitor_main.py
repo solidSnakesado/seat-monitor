@@ -35,7 +35,7 @@ def parse_args():
     ap.add_argument("--source", default="0", help="웹캠 번호 또는 스트림 URL")
     ap.add_argument("--pose-model", default=str(root / "assets" / "pose_landmarker_lite.task"))
     ap.add_argument("--face-model", default=str(root / "assets" / "face_landmarker.task"))
-    ap.add_argument("--calib-sec", type=float, default=5.0)
+    ap.add_argument("--calib-sec", type=float, default=10.0, help="시작 시 바른 자세 기준 등록 시간 (초, SR_007)")
     ap.add_argument("--posture-hold", type=float, default=Thresholds.hold_sec,
                     help="자세 문제 확정 시간(초), 실사용 30 이상 권장")
     ap.add_argument("--rule", action="store_true", help="학습 모델 없이 MediaPipe 규칙으로 자세 판정")
